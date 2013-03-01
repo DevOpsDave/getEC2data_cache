@@ -1,0 +1,11 @@
+*.swp
+maestro.json
+.rakeTasks
+.DS_Store
+target
+*.iml
+.idea/
+*.swo
+/manifests
+/modules
+cloudformation/expanded/
