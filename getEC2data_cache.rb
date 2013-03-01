@@ -70,15 +70,15 @@ def aws_query(time_now, cache_file_path)
   }
 
   # Grab any overtags.  All overtag keys (AT this point in the execution) begin must match this regex.
-  # /^ec2_tag_bv:.*:overtags$/.
+  # /^ec2_tag_bv_.*_overtags$/.
   # All overtags will be prefaced with the parent tag string + ":" + key name.
   overtags = {}
   tags.each_key do |key|
-    if key =~ /^ec2_tag_bv:.*:overtags$/
+    if key =~ /^ec2_tag_bv_.*_overtags$/
       tags[key].split(/\|/).each { |item|
         itemkey = item.split(/\:/)[0]
         itemval = item.split(/\:/)[1] ? item.split(/\:/)[1] : 'valueless_tag'
-        overtags[key + ":" + itemkey] = itemval
+        overtags[key + "_" + itemkey] = itemval
       }
     end
   end
