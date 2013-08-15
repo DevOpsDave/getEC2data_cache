@@ -1,4 +1,4 @@
-#!/usr/bin/env ruby
+#!/usr/bin/env ruby 
 
 require 'rubygems'
 require 'aws-sdk'
@@ -7,59 +7,139 @@ require 'yaml'
 require 'fileutils'
 require 'facter'
 
-# Work in progress.
-#def get_metadata(ec2_data, items)
-#  puts 'hi'
-#  items.each { |item|
-#    puts item
-#    begin
-#      resp = HTTParty.get("http://169.254.169.254/latest/meta-data/#{item}").parsed_response
-#    rescue
-#      next
-#    end
-#    if resp.split(/\n/).size > 1
-#      adjusted_paths = resp.split(/\n/).map { |x| "#{item}"+x }
-#      get_metadata(ec2_data, adjusted_paths)
-#    elsif resp.split(/\n/).size == 1
-#      ec2_data["ec2_metadata_"+item] = resp.split(/\n/)[0]
-#    else
-#      next
-#    end
-#  }
-#  ec2_data
-#end
+# Get all the data from the metadata service.
+module AWSdata
+
+  class MetaSrvc
+    # See /opt/aws/bin/ec2-metadata on an ec2 instance
+    @@supported_metadata = %w(
+        ami-id ami-launch-index ami-manifest-path block-device-mapping
+        instance-id instance-type local-hostname local-ipv4
+        kernel-id placement public-keys reservation-id
+        security-groups availability-zone region
+    )
+
+    # Some of the metadata properties do not keep there data directly under the base_uri.  It might be deeper.
+    @@deep_property_path = {
+        'availability-zone' => 'placement/availability-zone/',
+        'region'            => 'placement/availability-zone/'
+    }
+
+    # Post lookup value modification.
+    @@post_value_mod = {
+        'region' =>  lambda { |arg| "#{arg}".gsub(/(^.*-\d+)([a-z])/,'\1') }
+    }
+
+    def self.get(property)
+      include HTTParty
+      base_uri = 'http://169.254.169.254/latest/meta-data'
+
+      property_string = property.to_s
+      property_components = property_string.split '/'
+
+      # Make sure the property is supported.
+      raise "Unsupported property #{property_string}" unless @@supported_metadata.include? property_components.first
+
+      # Check to see if this property's data is deeper than the base_uri.  Modify property_string accordingly.
+      property_string = @@deep_property_path[property] unless @@deep_property_path[property].nil?
+
+      httparty_response = HTTParty.get "#{base_uri}/#{property_string}/", :timeout => 1
+      raise "Error retrieving #{property_string} metadata: HTTP Status #{httparty_response.response.code}" unless httparty_response.response.code == "200"
+
+      unless @@post_value_mod[property]
+        return httparty_response.body
+      else
+        curated_response = @@post_value_mod[property].call(httparty_response.body)
+        return curated_response
+      end
+    end
+
+    def self.get_hash(property)
+      value = self.get(property)
+      { :key => property, :value => value }
+    end
+
+    def self.get_all()
+      @@supported_metadata.collect { |k| self.get(k) }
+    end
+
+    def self.get_all_hash()
+      @@supported_metadata.collect { |k| self.get_hash(k) }
+    end
+
+  end
+
+  class EC2Tags
+    # EC2 tag stuff.
+    @@region = AWSdata::MetaSrvc.get('region')
+    @@instance_id = AWSdata::MetaSrvc.get('instance-id')
+    AWS.config({ :ec2_endpoint => "ec2.#{@@region}.amazonaws.com",
+                 :cf_endpoint => "cf.#{@@region}.amazonaws.com" })
+    @@ec2 = AWS::EC2.new
+
+    def self.tags_hash()
+      tag_list = @@ec2.client.describe_instances(:instance_ids => [@@instance_id])[:reservation_index][@@instance_id][:instances_set][0][:tag_set]
+      tag_list
+    end
+
+    def self.tag_hash(tag_name)
+      tag_list = self.tags_hash
+
+      tag_value = nil
+      begin
+        tag_value = tag_list.select { |x| x[:key] == tag_name }[0][:value]
+      rescue NoMethodError
+      end
+
+      unless tag_value.nil?
+        return { :key => tag_name, :value => tag_value }
+      end
+    end
+
+    def self.tag(tag_name)
+      tag_hash = self.tag_hash(tag_name)
+      return tag_hash[:value]
+    end
+  end
+
+  class CloudFormation
+    # Cloud formation stuff.
+    @@cf = AWS::CloudFormation.new
+    @@cf_stack_name = AWSdata::EC2Tags.tag('aws:cloudformation:stack-name')
+    @@cf_stack = @@cf.stacks[@@cf_stack_name]
+    @@cf_stack_params = @@cf_stack.parameters.collect { |k,v| { :key => k, :value => v } }
+
+    def self.stack_params_hash()
+      return @@cf_stack_params
+    end
+  end
+
+end
 
 # Does a lookup agains AWS and creates the cache_file.
 def aws_query(time_now, cache_file_path)
 
-  instance_id = HTTParty.get('http://169.254.169.254/latest/meta-data/instance-id').parsed_response
-  availability_zone = HTTParty.get('http://169.254.169.254/latest/meta-data/placement/availability-zone/').parsed_response
-  region = availability_zone[0..-2]
-
-  AWS.config({:ec2_endpoint => "ec2.#{region}.amazonaws.com"})
-  ec2 = AWS::EC2.new
-
-  # Get the tags.
+  # Get the ec2 tags.
+  # Trying to phase out the ec2_tag_ prefixed facters.  Want to just use the aws_ prefixed ones.  Less noise.
   tags = {}
-  tag_list = ec2.client.describe_instances(:instance_ids => [instance_id])[:reservation_index][instance_id][:instances_set][0][:tag_set]
-  tag_list.map { |entry|
+  AWSdata::EC2Tags.tags_hash.map { |entry|
     entry[:key].gsub!(/:|-/,'_')
     tags["ec2_tag_#{entry[:key]}"] = entry[:value]
+    tags["ec2_#{entry[:key]}"] = entry[:value]
   }
 
-  # TODO
-  # Trying to write a recursive function to get metadata.
-  # Get the metadata.
-  #response = HTTParty.get('http://169.254.169.254/latest/meta-data/').parsed_response
-  #tags = get_metadata(tags, response.split(/\n/))
+  # metadata.
+  AWSdata::MetaSrvc.get_all_hash.map { |entry|
+    entry[:key].gsub!(/:|-/,'_')
+    tags["ec2_tag_#{entry[:key]}"] = entry[:value]
+    tags["meta_#{entry[:key]}"] = entry[:value]
+  }
 
-  # Get the instance attributes.
-  meta_list = %w(instanceType kernel disableApiTermination instanceInitiatedShutdownBehavior)
-  meta_list.each do |item|
-    resp = ec2.client.describe_instance_attribute(:instance_id => instance_id, :attribute => item)
-    value = resp.data[item.gsub(/([A-Z])/, '_\1').downcase.to_sym][:value]
-    tags["ec2_attr_"+item] = value
-  end
+  # CF params.
+  AWSdata::CloudFormation.stack_params_hash.map { |entry|
+    entry[:key].gsub!(/:|-/,'_')
+    tags["cf_#{entry[:key]}"] = entry[:value]
+  }
 
   # read_tags_dot_txt
   file = '/etc/facter/facts.d/tags.txt'
@@ -68,22 +148,6 @@ def aws_query(time_now, cache_file_path)
     (key, val) = tag.split(/=/)
     tags[key] = val
   }
-
-  # Grab any overtags.  All overtag keys (AT this point in the execution) begin must match this regex.
-  # /^ec2_tag_bv_.*_overtags$/.
-  # All overtags will be prefaced with the parent tag string + ":" + key name.
-  overtags = {}
-  tags.each_key do |key|
-    if key =~ /^ec2_tag_bv_.*_overtags$/
-      tags[key].split(/\|/).each { |item|
-        itemkey = item.split(/\:/)[0]
-        itemval = item.split(/\:/)[1] ? item.split(/\:/)[1] : 'valueless_tag'
-        overtags[key + "_" + itemkey] = itemval
-      }
-    end
-  end
-  tags.merge!(overtags)
-
 
   # put the time stamp in.
   tags['cache_file_modification'] = time_now
